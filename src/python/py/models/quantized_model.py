@@ -627,7 +627,7 @@ class AWQModel(QuantizedModel):
                 self.repack(self.lm_head)
 
                 # Set `g_idx` to None since it's not used in `MatMulNBits`
-                q_tensors.g_idx = None
+                self.lm_head.g_idx = None
 
     def unpack_qweight(self, module):
         """
