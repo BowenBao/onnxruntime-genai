@@ -118,16 +118,16 @@ class QuantizedModel:
                         # transformer.rotary_pos_emb.inv_freq in ChatGLM3.
                         # Skip rotary embedding weights since they can be re-calculated when looping through the model
                         continue
-                    elif name == "lm_head.qweight":
+                    elif name == "lm_head.qweight" or name == "transformer.output_layer.qweight":
                         self._initialize_quantized_lm_head(bits, group_size)
                         self.lm_head.qweight = tensor
-                    elif name == "lm_head.qzeros":
+                    elif name == "lm_head.qzeros" or name == "transformer.output_layer.qzeros":
                         self._initialize_quantized_lm_head(bits, group_size)
                         self.lm_head.qzeros = tensor
-                    elif name == "lm_head.scales":
+                    elif name == "lm_head.scales" or name == "transformer.output_layer.scales":
                         self._initialize_quantized_lm_head(bits, group_size)
                         self.lm_head.scales = tensor
-                    elif name == "lm_head.g_idx":
+                    elif name == "lm_head.g_idx" or name == "transformer.output_layer.g_idx":
                         self._initialize_quantized_lm_head(bits, group_size)
                         self.lm_head.g_idx = tensor
                     else:
