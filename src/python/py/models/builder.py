@@ -2665,8 +2665,8 @@ class ChatGLMModel(Model):
         self.rotemb_attrs["rotary_embedding_dim"] = int(self.head_size * self.rotemb_attrs["partial_rotary_factor"])
         self.rotemb_attrs["interleaved"] = 1
         self.mlp_attrs["use_proj"], self.mlp_attrs["use_fc"] = True, False
-        self.attention_attrs["use_rotemb_in_attn"] = True
-        self.attention_attrs["use_packed_matmul"] = True
+        # self.attention_attrs["use_rotemb_in_attn"] = True
+        # self.attention_attrs["use_packed_matmul"] = True
         self.attention_attrs["op_type"] = "GroupQueryAttention" if self.multi_query_attention else self.attention_attrs["op_type"]
 
     def has_final_norm(self, module, model):
@@ -2684,7 +2684,6 @@ class ChatGLMModel(Model):
         if self.quant_type is None:
             super().make_attention_unpacked(layer_id, attention, root_input, **kwargs)
         return super().make_attention(layer_id, attention, root_input, **kwargs)
-
 
     def make_mlp_proj(self, layer_id, mlp, root_input):
         if self.quant_type is None:
