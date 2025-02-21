@@ -56,7 +56,6 @@ class TensorModule:
         self.weight = None
         self.bias = None
 
-
 class QuantizedAttention:
     def __init__(self, bits, group_size):
         self.q_proj = QuantizedTensorModule(bits, group_size)
@@ -88,22 +87,36 @@ class QuantizedDecoderLayer:
 
 
 class QuantizedModel:
-    def __init__(self, quant_type, input_path, bits, group_size, q_size, kv_size, intermediate_size, num_layers):
+    def __init__(self, quant_type, input_path, quant_attrs, q_size, kv_size, intermediate_size, num_layers):
         self.quant_type = quant_type
         self.embedding = TensorModule()
         self.final_norm = TensorModule()
         self.lm_head = TensorModule()
         self.layers = {}
         self.num_layers = num_layers
+        self.get_config(quant_attrs)
 
         layer_id = 0
         for weight_file in os.listdir(input_path):
             if weight_file.endswith(".safetensors"):
-                module = self.layers.setdefault(layer_id, QuantizedDecoderLayer(layer_id, bits, group_size))
+                module = None
                 weights = load_file(os.path.join(input_path, weight_file))
 
                 # Map weights to modules
                 for name, tensor in weights.items():
+                    
+                    self.local_bits = self.global_bits
+                    self.local_group_size = self.global_group_size
+                    
+                    # Per-layer quantization support
+                    if quant_type == "quark" and quant_attrs["config"]["layer_quant_config"]:
+                        self.get_layer_config(name, quant_attrs)
+
+                    if layer_id not in self.layers:
+                        module = self.layers.setdefault(layer_id, QuantizedDecoderLayer(layer_id, self.local_bits, self.global_group_size))
+                    else:
+                        module = self.layers[layer_id]
+
                     if tensor.dtype == torch.bfloat16:
                         # Cast bfloat16 to float32 since NumPy does not support bfloat16
                         tensor = tensor.to(torch.float32)
@@ -117,21 +130,45 @@ class QuantizedModel:
                         self.lm_head.weight = tensor
                     elif name == "lm_head.bias" or name == "transformer.output_layer.bias":
                         self.lm_head.bias = tensor
+                    elif name == "lm_head.weight_scale":
+                        if isinstance(self.lm_head, TensorModule):
+                            weight = self.lm_head.weight
+                            bias = self.lm_head.bias
+                            self.lm_head = QuantizedTensorModule(self.local_bits, self.local_group_size)
+                            self.lm_head.qweight = weight
+                            self.lm_head.bias = bias
+                        self.lm_head.scales = tensor
+                    elif name == "lm_head.weight_zero_point":
+                        if isinstance(self.lm_head, TensorModule):
+                            weight = self.lm_head.weight
+                            bias = self.lm_head.bias
+                            self.lm_head = QuantizedTensorModule(self.local_bits, self.local_group_size)
+                            self.lm_head.qweight = weight
+                            self.lm_head.bias = bias
+                        self.lm_head.qzeros = tensor
+                    elif name == "lm_head.g_idx" or name == "transformer.output_layer.g_idx":
+                        if isinstance(self.lm_head, TensorModule):
+                            weight = self.lm_head.weight
+                            bias = self.lm_head.bias
+                            self.lm_head = QuantizedTensorModule(self.local_bits, self.local_group_size)
+                            self.lm_head.qweight = weight
+                            self.lm_head.bias = bias
+                        self.lm_head.g_idx = tensor
                     elif name == "transformer.rotary_pos_emb.inv_freq":
                         # transformer.rotary_pos_emb.inv_freq in ChatGLM3.
                         # Skip rotary embedding weights since they can be re-calculated when looping through the model
                         continue
                     elif name == "lm_head.qweight" or name == "transformer.output_layer.qweight":
-                        self._initialize_quantized_lm_head(bits, group_size)
+                        self._initialize_quantized_lm_head(self.local_bits, self.local_group_size)
                         self.lm_head.qweight = tensor
                     elif name == "lm_head.qzeros" or name == "transformer.output_layer.qzeros":
-                        self._initialize_quantized_lm_head(bits, group_size)
+                        self._initialize_quantized_lm_head(self.local_bits, self.local_group_size)
                         self.lm_head.qzeros = tensor
                     elif name == "lm_head.scales" or name == "transformer.output_layer.scales":
-                        self._initialize_quantized_lm_head(bits, group_size)
+                        self._initialize_quantized_lm_head(self.local_bits, self.local_group_size)
                         self.lm_head.scales = tensor
                     elif name == "lm_head.g_idx" or name == "transformer.output_layer.g_idx":
-                        self._initialize_quantized_lm_head(bits, group_size)
+                        self._initialize_quantized_lm_head(self.local_bits, self.local_group_size)
                         self.lm_head.g_idx = tensor
                     else:
                         if name.startswith("transformer.encoder"):
@@ -141,7 +178,7 @@ class QuantizedModel:
                         if curr_layer_id != layer_id:
                             # Switch layer module used
                             layer_id = curr_layer_id
-                            module = self.layers.setdefault(layer_id, QuantizedDecoderLayer(layer_id, bits, group_size))
+                            module = self.layers.setdefault(layer_id, QuantizedDecoderLayer(layer_id, self.local_bits, self.local_group_size))
 
                         # Map weights and biases of norm, attention, and feed-forward network
                         # Graph order is input_layernorm --> q_proj/k_proj/v_proj --> o_proj --> post_attention_layernorm --> gate_proj/up_proj --> down_proj
@@ -155,13 +192,13 @@ class QuantizedModel:
                             # model.layers.layer_id.self_attn.rotary_emb.inv_freq
                             # Skip rotary embedding weights since they can be re-calculated when looping through the model
                             continue
-                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.q_proj\.qweight$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.q_proj\.q?weight$", name)):
                             # model.layers.layer_id.self_attn.q_proj.qweight
                             module.self_attn.q_proj.qweight = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.q_proj\.scales$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.q_proj\.(scales|weight_scale)$", name)):
                             # model.layers.layer_id.self_attn.q_proj.scales
                             module.self_attn.q_proj.scales = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.q_proj\.qzeros$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.q_proj\.(qzeros|weight_zero_point)$", name)):
                             # model.layers.layer_id.self_attn.q_proj.qzeros
                             module.self_attn.q_proj.qzeros = tensor
                         elif bool(re.match(r"^model.layers\.\d+\.self_attn.q_proj\.g_idx$", name)):
@@ -170,13 +207,13 @@ class QuantizedModel:
                         elif bool(re.match(r"^model.layers\.\d+\.self_attn.q_proj\.bias$", name)):
                             # model.layers.layer_id.self_attn.q_proj.bias
                             module.self_attn.q_proj.bias = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.k_proj\.qweight$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.k_proj\.q?weight$", name)):
                             # model.layers.layer_id.self_attn.k_proj.qweight
                             module.self_attn.k_proj.qweight = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.k_proj\.scales$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.k_proj\.(scales|weight_scale)$", name)):
                             # model.layers.layer_id.self_attn.k_proj.scales
                             module.self_attn.k_proj.scales = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.k_proj\.qzeros$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.k_proj\.(qzeros|weight_zero_point)$", name)):
                             # model.layers.layer_id.self_attn.k_proj.qzeros
                             module.self_attn.k_proj.qzeros = tensor
                         elif bool(re.match(r"^model.layers\.\d+\.self_attn.k_proj\.g_idx$", name)):
@@ -185,13 +222,13 @@ class QuantizedModel:
                         elif bool(re.match(r"^model.layers\.\d+\.self_attn.k_proj\.bias$", name)):
                             # model.layers.layer_id.self_attn.k_proj.bias
                             module.self_attn.k_proj.bias = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.v_proj\.qweight$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.v_proj\.q?weight$", name)):
                             # model.layers.layer_id.self_attn.v_proj.qweight
                             module.self_attn.v_proj.qweight = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.v_proj\.scales$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.v_proj\.(scales|weight_scale)$", name)):
                             # model.layers.layer_id.self_attn.v_proj.scales
                             module.self_attn.v_proj.scales = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.v_proj\.qzeros$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn.v_proj\.(qzeros|weight_zero_point)$", name)):
                             # model.layers.layer_id.self_attn.v_proj.qzeros
                             module.self_attn.v_proj.qzeros = tensor
                         elif bool(re.match(r"^model.layers\.\d+\.self_attn.v_proj\.g_idx$", name)):
@@ -200,15 +237,15 @@ class QuantizedModel:
                         elif bool(re.match(r"^model.layers\.\d+\.self_attn.v_proj\.bias$", name)):
                             # model.layers.layer_id.self_attn.v_proj.bias
                             module.self_attn.v_proj.bias = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.(self_attn.o_proj|self_attention.dense)\.qweight$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.(self_attn.o_proj|self_attention.dense)\.q?weight$", name)):
                             # model.layers.layer_id.self_attn.o_proj.qweight
                             # model.layers.layer_id.self_attention.dense.qweight
                             module.self_attn.o_proj.qweight = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.(self_attn.o_proj|self_attention.dense)\.scales$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.(self_attn.o_proj|self_attention.dense)\.(scales|weight_scale)$", name)):
                             # model.layers.layer_id.self_attn.o_proj.scales
                             # model.layers.layer_id.self_attention.dense.scales
                             module.self_attn.o_proj.scales = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.(self_attn.o_proj|self_attention.dense)\.qzeros$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.(self_attn.o_proj|self_attention.dense)\.(qzeros|weight_zero_point)$", name)):
                             # model.layers.layer_id.self_attn.o_proj.qzeros
                             # model.layers.layer_id.self_attention.dense.qzeros
                             module.self_attn.o_proj.qzeros = tensor
@@ -241,13 +278,13 @@ class QuantizedModel:
                         elif bool(re.match(r"^model.layers\.\d+\.mlp.gate_proj\.bias$", name)):
                             # model.layers.layer_id.mlp.gate_proj.bias
                             module.mlp.gate_proj.bias = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.mlp.up_proj\.qweight$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.mlp.up_proj\.q?weight$", name)):
                             # model.layers.layer_id.mlp.up_proj.qweight
                             module.mlp.up_proj.qweight = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.mlp.up_proj\.scales$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.mlp.up_proj\.(scales|weight_scale)$", name)):
                             # model.layers.layer_id.mlp.up_proj.scales
                             module.mlp.up_proj.scales = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.mlp.up_proj\.qzeros$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.mlp.up_proj\.(qzeros|weight_zero_point)$", name)):
                             # model.layers.layer_id.mlp.up_proj.qzeros
                             module.mlp.up_proj.qzeros = tensor
                         elif bool(re.match(r"^model.layers\.\d+\.mlp.up_proj\.g_idx$", name)):
@@ -256,15 +293,15 @@ class QuantizedModel:
                         elif bool(re.match(r"^model.layers\.\d+\.mlp.up_proj\.bias$", name)):
                             # model.layers.layer_id.mlp.up_proj.bias
                             module.mlp.up_proj.bias = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(down_proj|dense_4h_to_h)\.qweight$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(down_proj|dense_4h_to_h)\.q?weight$", name)):
                             # model.layers.layer_id.mlp.down_proj.qweight
                             # model.layers.layer_id.mlp.dense_4h_to_h.qweight
                             module.mlp.down_proj.qweight = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(down_proj|dense_4h_to_h)\.scales$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(down_proj|dense_4h_to_h)\.(weight_scale|scales)$", name)):
                             # model.layers.layer_id.mlp.down_proj.scales
                             # model.layers.layer_id.mlp.dense_4h_to_h.scales
                             module.mlp.down_proj.scales = tensor
-                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(down_proj|dense_4h_to_h)\.qzeros$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(down_proj|dense_4h_to_h)\.(qzeros|weight_zero_point)$", name)):
                             # model.layers.layer_id.mlp.down_proj.qzeros
                             # model.layers.layer_id.mlp.dense_4h_to_h.qzeros
                             module.mlp.down_proj.qzeros = tensor
@@ -280,8 +317,8 @@ class QuantizedModel:
                         elif bool(re.match(r"^model.layers\.\d+\.(self_attn.qkv_proj|self_attention.query_key_value)\.qweight$", name)):
                             # model.layers.layer_id.self_attn.qkv_proj.qweight
                             # model.layers.layer_id.self_attention.query_key_value.qweight
-                            q_dim = q_size // (32 // bits) if quant_type == "awq" else q_size
-                            kv_dim = kv_size // (32 // bits) if quant_type == "awq" else kv_size
+                            q_dim = q_size // (32 // self.global_bits) if quant_type == "awq" else q_size
+                            kv_dim = kv_size // (32 // self.global_bits) if quant_type == "awq" else kv_size
                             module.self_attn.q_proj.qweight = tensor[:, : q_dim]
                             module.self_attn.k_proj.qweight = tensor[:, q_dim : q_dim + kv_dim]
                             module.self_attn.v_proj.qweight = tensor[:, q_dim + kv_dim :]
@@ -294,8 +331,8 @@ class QuantizedModel:
                         elif bool(re.match(r"^model.layers\.\d+\.(self_attn.qkv_proj|self_attention.query_key_value)\.qzeros$", name)):
                             # model.layers.layer_id.self_attn.qkv_proj.qzeros
                             # model.layers.layer_id.self_attention.query_key_value.qzeros
-                            q_dim = q_size // (32 // bits) if quant_type in {"awq", "gptq"} else q_size
-                            kv_dim = kv_size // (32 // bits) if quant_type in {"awq", "gptq"} else kv_size
+                            q_dim = q_size // (32 // self.global_bits) if quant_type in {"awq", "gptq"} else q_size
+                            kv_dim = kv_size // (32 // self.global_bits) if quant_type in {"awq", "gptq"} else kv_size
                             module.self_attn.q_proj.qzeros = tensor[:, : q_dim]
                             module.self_attn.k_proj.qzeros = tensor[:, q_dim : q_dim + kv_dim]
                             module.self_attn.v_proj.qzeros = tensor[:, q_dim + kv_dim :]
@@ -311,21 +348,21 @@ class QuantizedModel:
                             module.self_attn.q_proj.bias = tensor[: q_size]
                             module.self_attn.k_proj.bias = tensor[q_size : q_size + kv_size]
                             module.self_attn.v_proj.bias = tensor[q_size + kv_size : ]
-                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(gate_up_proj|dense_h_to_4h)\.qweight$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(gate_up_proj|dense_h_to_4h|gate_proj)\.q?weight$", name)):
                             # model.layers.layer_id.mlp.gate_up_proj.qweight
                             # model.layers.layer_id.mlp.dense_h_to_4h.qweight
-                            intermediate_dim = intermediate_size // (32 // bits) if quant_type == "awq" else intermediate_size
+                            intermediate_dim = intermediate_size // (32 // self.global_bits) if quant_type == "awq" else intermediate_size
                             module.mlp.gate_proj.qweight = tensor[:, : intermediate_dim]
                             module.mlp.up_proj.qweight = tensor[:, intermediate_dim :]
-                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(gate_up_proj|dense_h_to_4h)\.scales$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(gate_up_proj|dense_h_to_4h|gate_proj)\.(scales|weight_scale)$", name)):
                             # model.layers.layer_id.mlp.gate_up_proj.scales
                             # model.layers.layer_id.mlp.dense_h_to_4h.scales
                             module.mlp.gate_proj.scales = tensor[:, : intermediate_size]
                             module.mlp.up_proj.scales = tensor[:, intermediate_size :]
-                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(gate_up_proj|dense_h_to_4h)\.qzeros$", name)):
+                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(gate_up_proj|dense_h_to_4h|gate_proj)\.(qzeros|weight_zero_point)$", name)):
                             # model.layers.layer_id.mlp.gate_up_proj.qzeros
                             # model.layers.layer_id.mlp.dense_h_to_4h.qzeros
-                            intermediate_dim = intermediate_size // (32 // bits) if quant_type in {"awq", "gptq"} else intermediate_size
+                            intermediate_dim = intermediate_size // (32 // self.global_bits) if quant_type in {"awq", "gptq"} else intermediate_size
                             module.mlp.gate_proj.qzeros = tensor[:, : intermediate_dim]
                             module.mlp.up_proj.qzeros = tensor[:, intermediate_dim :]
                         elif bool(re.match(r"^model.layers\.\d+\.mlp.(gate_up_proj|dense_h_to_4h)\.g_idx$", name)):
@@ -355,6 +392,44 @@ class QuantizedModel:
         # Set properties of each layer based on quantization type
         self.set_properties()
 
+    def get_config(self, quant_attrs):
+        if self.quant_type == "quark":
+            self.global_quant_config = quant_attrs["config"]["global_quant_config"]["weight"]
+            self.global_group_size = self.global_quant_config["group_size"]
+            global_dtype = self.global_quant_config["dtype"]
+
+            dtype_bits_maps = {
+                "uint4": 4,
+                "int4": 4,
+            }
+
+            self.global_bits = dtype_bits_maps[global_dtype]
+
+            if self.global_bits is None:
+                raise NotImplementedError(f"Dtype: {global_dtype} not supported.")
+        else:
+            self.global_group_size = quant_attrs["config"]["group_size"]
+            self.global_bits = quant_attrs["config"]["bits"]
+    
+    def get_layer_config(self, layer_name, quant_attrs):
+        # basic layer specific configuration for quark
+
+        name = layer_name.split(".")[0]
+        if name in quant_attrs["config"]["layer_quant_config"]:
+            layer_quant_config = quant_attrs["config"]["layer_quant_config"][name]["weight"]
+            self.local_group_size = layer_quant_config["group_size"]
+            local_dtype = layer_quant_config["dtype"]
+
+            if local_dtype:
+                dtype_bits_maps = {
+                    "uint4": 4,
+                    "int4": 4,
+                }  
+            
+                local_bits = dtype_bits_maps[local_dtype]
+                if local_bits is None:
+                    raise NotImplementedError(f"Dtype: {local_dtype} not supported.")
+
     def _initialize_quantized_lm_head(self, bits, group_size):
         """
         Initialize `QuantizedTensorModule` for LM head if not already set
@@ -370,7 +445,7 @@ class QuantizedModel:
         Set in_features, out_features, and g_idx based on quantization type
         """
         if isinstance(self.lm_head, QuantizedTensorModule):
-            if self.quant_type == "awq":
+            if self.quant_type == "awq" or self.quant_type == "quark":
                 self.lm_head.out_features = self.lm_head.scales.shape[1]
                 self.lm_head.in_features = self.lm_head.qweight.shape[0]
                 # Set g_idx if not already set
@@ -381,7 +456,7 @@ class QuantizedModel:
             else:
                 raise NotImplementedError(f"The {self.quant_type} quantization method is not recognized.")
         for module in self.layers:
-            if self.quant_type == "awq":
+            if self.quant_type == "awq" or self.quant_type == "quark":
                 # Set in_features and out_features
                 module.self_attn.q_proj.out_features = module.self_attn.q_proj.scales.shape[1]
                 module.self_attn.q_proj.in_features = module.self_attn.q_proj.qweight.shape[0]
@@ -591,8 +666,8 @@ class QuantizedModel:
 
 
 class AWQModel(QuantizedModel):
-    def __init__(self, quant_type, input_path, bits, group_size, q_size, kv_size, intermediate_size, num_layers):
-        super().__init__(quant_type, input_path, bits, group_size, q_size, kv_size, intermediate_size, num_layers)
+    def __init__(self, quant_type, input_path, quant_attrs, q_size, kv_size, intermediate_size, num_layers):
+        super().__init__(quant_type, input_path, quant_attrs, q_size, kv_size, intermediate_size, num_layers)
 
         # Unpack and repack all `QuantizedTensorModule` classes in model
         for i, layer in enumerate(self.layers):
@@ -602,7 +677,7 @@ class AWQModel(QuantizedModel):
 
             # Unpack and repack all `QuantizedTensorModule` classes in attention
             self_attn = getattr(layer, "self_attn", None) or getattr(layer, "self_attention", None)
-            for name, q_tensors in self_attn.__dict__.items():
+            for _, q_tensors in self_attn.__dict__.items():
                 if isinstance(q_tensors, QuantizedTensorModule) and q_tensors.qweight is not None:
                     self.unpack(q_tensors)
                     self.repack(q_tensors)
@@ -611,7 +686,7 @@ class AWQModel(QuantizedModel):
                     q_tensors.g_idx = None
 
             # Unpack and repack all `Quantized TensorModule` classes in MLP
-            for name, q_tensors in layer.mlp.__dict__.items():
+            for _, q_tensors in layer.mlp.__dict__.items():
                 if isinstance(q_tensors, QuantizedTensorModule) and q_tensors.qweight is not None:
                     self.unpack(q_tensors)
                     self.repack(q_tensors)
@@ -666,8 +741,8 @@ class AWQModel(QuantizedModel):
 
 
 class GPTQModel(QuantizedModel):
-    def __init__(self, quant_type, input_path, bits, group_size, use_g_idx, q_size, kv_size, intermediate_size, num_layers):
-        super().__init__(quant_type, input_path, bits, group_size, q_size, kv_size, intermediate_size, num_layers)
+    def __init__(self, quant_type, input_path, quant_attrs, q_size, kv_size, intermediate_size, num_layers):
+        super().__init__(quant_type, input_path, quant_attrs, q_size, kv_size, intermediate_size, num_layers)
 
         # Unpack and repack all `QuantizedTensorModule` classes in model
         for i, layer in enumerate(self.layers):
@@ -676,24 +751,24 @@ class GPTQModel(QuantizedModel):
             print(f"Unpacking and repacking layer {i}")
 
             # Unpack and repack all `QuantizedTensorModule` classes in attention
-            for name, q_tensors in layer.self_attn.__dict__.items():
+            for _, q_tensors in layer.self_attn.__dict__.items():
                 if isinstance(q_tensors, QuantizedTensorModule) and q_tensors.qweight is not None:
                     self.handle_qzeros(q_tensors)
                     self.unpack(q_tensors)
                     self.repack(q_tensors)
 
-                    if not use_g_idx:
+                    if not quant_attrs["use_g_idx"]:
                         # Set `g_idx` to None since it's not used in `MatMulNBits`
                         q_tensors.g_idx = None
 
             # Unpack and repack all `QuantizedTensorModule` classes in MLP
-            for name, q_tensors in layer.mlp.__dict__.items():
+            for _, q_tensors in layer.mlp.__dict__.items():
                 if isinstance(q_tensors, QuantizedTensorModule) and q_tensors.qweight is not None:
                     self.handle_qzeros(q_tensors)
                     self.unpack(q_tensors)
                     self.repack(q_tensors)
 
-                    if not use_g_idx:
+                    if not quant_attrs["use_g_idx"]:
                         # Set `g_idx` to None since it's not used in `MatMulNBits`
                         q_tensors.g_idx = None
 
@@ -702,7 +777,7 @@ class GPTQModel(QuantizedModel):
             self.unpack(self.lm_head)
             self.repack(self.lm_head)
 
-            if not use_g_idx:
+            if not quant_attrs["use_g_idx"]:
                 # Set `g_idx` to None since it's not used in `MatMulNBits`
                 self.lm_head.g_idx = None
 
@@ -730,19 +805,93 @@ class GPTQModel(QuantizedModel):
         self.pack_qzeros(temp_module)
         module.qzeros = temp_module.qzeros
 
+class QuarkModel(QuantizedModel):
+    def __init__(self, quant_type, input_path, quant_attrs, q_size, kv_size, intermediate_size, num_layers):
+        super().__init__(quant_type, input_path, quant_attrs, q_size, kv_size, intermediate_size, num_layers)
+        
+        # Unpack and repack all `QuantizedTensorModule` classes in model
+        for i, layer in enumerate(self.layers):
+            if i >= self.num_layers:
+                break
+
+            # Unpack and repack all `QuantizedTensorModule` classes in attention
+            self_attn = getattr(layer, "self_attn", None) or getattr(layer, "self_attention", None)
+            for _, q_tensors in self_attn.__dict__.items():
+                if isinstance(q_tensors, QuantizedTensorModule) and q_tensors.qweight is not None:
+                    self.unpack(q_tensors)
+                    self.repack(q_tensors)
+
+                    # Set `g_idx` to None since it's not used in `MatMulNBits`
+                    q_tensors.g_idx = None
+
+            # Unpack and repack all `Quantized TensorModule` classes in MLP
+            for _, q_tensors in layer.mlp.__dict__.items():
+                if isinstance(q_tensors, QuantizedTensorModule) and q_tensors.qweight is not None:
+                    self.unpack(q_tensors)
+                    self.repack(q_tensors)
+
+                    # Set `g_idx` to None since it's not used in `MatMulNBits`
+                    q_tensors.g_idx = None
+
+        if isinstance(self.lm_head, QuantizedTensorModule) and self.lm_head.qweight is not None:
+            self.unpack(self.lm_head)
+            self.repack(self.lm_head)
+
+            # Set `g_idx` to None since it's not used in `MatMulNBits`
+            self.lm_head.g_idx = None
+
+    def unpack_qweight(self, module):
+        """
+        Unpack `qweight` to standard format
+        """
+        expected_shape = (module.qweight.shape[0], module.out_features)
+        transpose = module.qweight.shape != expected_shape
+        module.qweight = self.unpack_on_row(module.qweight.T, module.bits, transpose)
+        module.qweight = self.reverse_reorder_tensor(module.qweight.T, module.bits)
+
+    def unpack_qzeros(self, module):
+        """
+        Unpack `qzeros` to standard format
+        """
+        super().unpack_qzeros(module)
+        module.qzeros = self.reverse_reorder_tensor(module.qzeros, module.bits)
+
+    def reverse_reorder_tensor(self, tensor, bits):
+        """
+        Re-arrange tensor data in a new order
+        """
+        compress_ratio = 32 // bits
+        assert tensor.shape[-1] % compress_ratio == 0
+
+        if bits == 4:
+            order_map = [0, 2, 4, 6, 1, 3, 5, 7]
+        else:
+            raise NotImplementedError(f"Unpacking for {bits}-bit quantization is not currently supported.")
+
+        order_tensor = torch.tensor(order_map, dtype=torch.int32).reshape(1, -1)
+        order_tensor = order_tensor.repeat(tensor.shape[1] // compress_ratio, 1)
+        order_tensor = order_tensor + torch.arange(0, tensor.shape[1], compress_ratio, dtype=torch.int32).reshape(-1, 1)
+        order_tensor = order_tensor.reshape(-1)
+
+        reverse_order_tensor = torch.arange(order_tensor.shape[0])[order_tensor]
+        reverse_order_tensor = reverse_order_tensor[order_tensor]
+        int_tensor = tensor[:, reverse_order_tensor]
+        return int_tensor
 
 class QuantModel:
     @staticmethod
-    def from_pretrained(quant_type, input_path, bits, group_size, use_g_idx, q_size, kv_size, intermediate_size, num_layers):
+    def from_pretrained(quant_type, **kwargs):
         """
         Unpack quantized weights in PyTorch models, store them in a standard format, and repack them
         into ONNX Runtime's format. Also performs any pre-processing and post-processing when unpacking
         the quantized weights.
         """
         if quant_type == "awq":
-            model = AWQModel(quant_type, input_path, bits, group_size, q_size, kv_size, intermediate_size, num_layers)
+            model = AWQModel(quant_type, **kwargs)
         elif quant_type == "gptq":
-            model = GPTQModel(quant_type, input_path, bits, group_size, use_g_idx, q_size, kv_size, intermediate_size, num_layers)
+            model = GPTQModel(quant_type, **kwargs)
+        elif quant_type == "quark":
+            model = QuarkModel(quant_type, **kwargs)
         else:
             raise NotImplementedError(f"The {quant_type} quantized model is not currently supported.")
 
