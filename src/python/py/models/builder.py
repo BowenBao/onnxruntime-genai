@@ -1238,6 +1238,9 @@ class Model:
 
     def make_qk_norm(self, layer_id, attention):
         # Make subgraph to compute SimplifiedLayerNorm after Q and K MatMuls in attention:
+        # Depending on LayerNorm weight shape, the subgraph may look like one of the following:
+        #
+        # 1. If LayerNorm weight shape is (H,), e.g., Gemma3:
         #
         #     root_input (BxSxD)
         #          |
@@ -1246,51 +1249,82 @@ class Model:
         #  SimplifiedLayerNorm (BxSxNxH)
         #          |
         #       Reshape (BxSxD)
+        #
+        # 2. If LayerNorm weight shape is (NxH,), e.g., Instella:
+        #
+        #     root_input (BxSxD)
+        #          |
+        #  SimplifiedLayerNorm (BxSxD)
 
         # Save kwargs shared by LayerNorm ops
         layernorm_kwargs = {"epsilon": self.layernorm_attrs["epsilon"], "axis": -1, "stash_type": 1}
 
-        # Reshape Q MatMul from BxSxD to Bx(SxN)xH before LayerNorm
-        q_reshape_1_name = f"/model/layers.{layer_id}/attn/q_norm/Reshape_1"
-        q_reshape_1_inputs = [self.attention_attrs["q_path"], f"/model/constants/TensorProto.INT64/1D/0, -1, {self.head_size}"]
-        q_reshape_1_output = f"{q_reshape_1_name}/output_0"
-        self.make_reshape(q_reshape_1_name, q_reshape_1_inputs, dtype=self.io_dtype, shape=['batch_size', 'sequence_length * num_attention_heads', self.head_size])
+        q_norm_needs_reshape = (attention.q_norm.weight.shape[0] == self.head_size)
+
+        if q_norm_needs_reshape:
+            # Reshape Q MatMul from BxSxD to Bx(SxN)xH before LayerNorm
+            q_norm_shape = ['batch_size', 'sequence_length * num_attention_heads', self.head_size]
+            q_reshape_1_name = f"/model/layers.{layer_id}/attn/q_norm/Reshape_1"
+            q_reshape_1_inputs = [self.attention_attrs["q_path"], f"/model/constants/TensorProto.INT64/1D/0, -1, {self.head_size}"]
+            q_reshape_1_output = f"{q_reshape_1_name}/output_0"
+            self.make_reshape(q_reshape_1_name, q_reshape_1_inputs, dtype=self.io_dtype, shape=q_norm_shape)
+            q_norm_input = q_reshape_1_output
+        else:
+            q_norm_shape = ['batch_size', 'sequence_length', self.num_attn_heads * self.head_size]
+            q_norm_input = self.attention_attrs["q_path"]
 
         # Make Q LayerNorm
         q_layernorm_name = f"/model/layers.{layer_id}/attn/q_norm/SimplifiedLayerNormalization"
         q_weight_name = f"model.layers.{layer_id}.attn.q_norm.layernorm.weight"
         q_layernorm_output = f"{q_layernorm_name}/output_0"
         self.make_external_tensor(attention.q_norm.weight.detach().numpy().astype(self.to_numpy_dtype[self.io_dtype]) + self.layernorm_attrs["add_offset"], q_weight_name)
-        self.make_node("SimplifiedLayerNormalization", inputs=[q_reshape_1_output, q_weight_name], outputs=[q_layernorm_output], name=q_layernorm_name, **layernorm_kwargs)
-        self.make_value_info(q_layernorm_output, dtype=self.io_dtype, shape=['batch_size', 'sequence_length * num_attention_heads', self.head_size])
+        self.make_node("SimplifiedLayerNormalization", inputs=[q_norm_input, q_weight_name], outputs=[q_layernorm_output], name=q_layernorm_name, **layernorm_kwargs)
+        self.make_value_info(q_layernorm_output, dtype=self.io_dtype, shape=q_norm_shape)
 
-        # Reshape Q path after LayerNorm from Bx(SxN)xH to BxSxD
-        q_reshape_2_name = f"/model/layers.{layer_id}/attn/q_norm/Reshape_2"
-        q_reshape_2_inputs = [q_layernorm_output, f"/model/constants/TensorProto.INT64/1D/0, -1, {self.num_attn_heads * self.head_size}"]
-        self.make_reshape(q_reshape_2_name, q_reshape_2_inputs, dtype=self.io_dtype, shape=['batch_size', 'sequence_length', self.num_attn_heads * self.head_size])
+        if q_norm_needs_reshape:
+            # Reshape Q path after LayerNorm from Bx(SxN)xH to BxSxD
+            q_reshape_2_name = f"/model/layers.{layer_id}/attn/q_norm/Reshape_2"
+            q_reshape_2_inputs = [q_layernorm_output, f"/model/constants/TensorProto.INT64/1D/0, -1, {self.num_attn_heads * self.head_size}"]
+            self.make_reshape(q_reshape_2_name, q_reshape_2_inputs, dtype=self.io_dtype, shape=['batch_size', 'sequence_length', self.num_attn_heads * self.head_size])
+            q_output_name = f"{q_reshape_2_name}/output_0"
+        else:
+            q_output_name = q_layernorm_output
 
-        # Reshape K MatMul from BxSxD to Bx(SxN)xH before LayerNorm
-        k_reshape_1_name = f"/model/layers.{layer_id}/attn/k_norm/Reshape_1"
-        k_reshape_1_inputs = [self.attention_attrs["k_path"], f"/model/constants/TensorProto.INT64/1D/0, -1, {self.head_size}"]
-        k_reshape_1_output = f"{k_reshape_1_name}/output_0"
-        self.make_reshape(k_reshape_1_name, k_reshape_1_inputs, dtype=self.io_dtype, shape=['batch_size', 'sequence_length * num_key_value_heads', self.head_size])
+        k_norm_needs_reshape = (attention.k_norm.weight.shape[0] == self.head_size)
+
+        if k_norm_needs_reshape:
+            # Reshape K MatMul from BxSxD to Bx(SxN)xH before LayerNorm
+            k_norm_shape = ['batch_size', 'sequence_length * num_key_value_heads', self.head_size]
+            k_reshape_1_name = f"/model/layers.{layer_id}/attn/k_norm/Reshape_1"
+            k_reshape_1_inputs = [self.attention_attrs["k_path"], f"/model/constants/TensorProto.INT64/1D/0, -1, {self.head_size}"]
+            k_reshape_1_output = f"{k_reshape_1_name}/output_0"
+            self.make_reshape(k_reshape_1_name, k_reshape_1_inputs, dtype=self.io_dtype, shape=k_norm_shape)
+            k_norm_input = k_reshape_1_output
+        else:
+            k_norm_shape = ['batch_size', 'sequence_length', self.num_kv_heads * self.head_size]
+            k_norm_input = self.attention_attrs["k_path"]
 
         # Make K LayerNorm
         k_layernorm_name = f"/model/layers.{layer_id}/attn/k_norm/SimplifiedLayerNormalization"
         k_weight_name = f"model.layers.{layer_id}.attn.k_norm.layernorm.weight"
         k_layernorm_output = f"{k_layernorm_name}/output_0"
         self.make_external_tensor(attention.k_norm.weight.detach().numpy().astype(self.to_numpy_dtype[self.io_dtype]) + self.layernorm_attrs["add_offset"], k_weight_name)
-        self.make_node("SimplifiedLayerNormalization", inputs=[k_reshape_1_output, k_weight_name], outputs=[k_layernorm_output], name=k_layernorm_name, **layernorm_kwargs)
-        self.make_value_info(k_layernorm_output, dtype=self.io_dtype, shape=['batch_size', 'sequence_length * num_key_value_heads', self.head_size])
+        self.make_node("SimplifiedLayerNormalization", inputs=[k_norm_input, k_weight_name], outputs=[k_layernorm_output], name=k_layernorm_name, **layernorm_kwargs)
+        self.make_value_info(k_layernorm_output, dtype=self.io_dtype, shape=k_norm_shape)
 
-        # Reshape K path after LayerNorm from Bx(SxN)xH to BxSxD
-        k_reshape_2_name = f"/model/layers.{layer_id}/attn/k_norm/Reshape_2"
-        k_reshape_2_inputs = [k_layernorm_output, f"/model/constants/TensorProto.INT64/1D/0, -1, {self.num_kv_heads * self.head_size}"]
-        self.make_reshape(k_reshape_2_name, k_reshape_2_inputs, dtype=self.io_dtype, shape=['batch_size', 'sequence_length', self.num_kv_heads * self.head_size])
+        if k_norm_needs_reshape:
+            # Reshape K path after LayerNorm from Bx(SxN)xH to BxSxD
+            k_reshape_2_name = f"/model/layers.{layer_id}/attn/k_norm/Reshape_2"
+            k_reshape_2_inputs = [k_layernorm_output, f"/model/constants/TensorProto.INT64/1D/0, -1, {self.num_kv_heads * self.head_size}"]
+            self.make_reshape(k_reshape_2_name, k_reshape_2_inputs, dtype=self.io_dtype, shape=['batch_size', 'sequence_length', self.num_kv_heads * self.head_size])
+            k_output_name = f"{k_reshape_2_name}/output_0"
+        else:
+            k_output_name = k_layernorm_output
 
-        # Update q_path and k_path now
-        self.attention_attrs["q_path"] = f"{q_reshape_2_name}/output_0"
-        self.attention_attrs["k_path"] = f"{k_reshape_2_name}/output_0"
+        # Update paths
+        self.attention_attrs["q_path"] = q_output_name
+        self.attention_attrs["k_path"] = k_output_name
+
 
     def make_repeat_kv(self, layer_id, root_input, past_kv, present_kv, **kwargs):
         # Make subgraph that repeats tensor of shape (batch_size, sequence_length, num_kv_heads, head_size)
@@ -3261,6 +3295,24 @@ class Gemma3Model(Gemma2Model):
         sin_cache_name = kwargs.get("sin_cache_name", self.sin_cache_global_name if self.window_size == -1 else self.sin_cache_local_name)
         return super().make_rotary_embedding_caches(cos_cache_name=cos_cache_name, sin_cache_name=sin_cache_name)
 
+class InstellaModel(Model):
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+        self.attention_attrs["use_qk_norm"] = True
+
+    def make_layer(self, layer_id, layer):
+        # Instella decoder layer is defined as:
+        # pre_attention_layernorm --> attention (with q_norm and k_norm) --> pre_feedforward_layernorm --> MLP
+        self.make_layernorm(layer_id, layer.pre_attention_layernorm, skip=not self.layernorm_attrs["first_layernorm"], simple=self.layernorm_attrs["simple"], location="input")
+        self.make_attention(layer_id, layer.self_attn, root_input=self.layernorm_attrs["output_0"])
+        self.make_layernorm(layer_id, layer.pre_feedforward_layernorm, skip=True, simple=self.layernorm_attrs["simple"], location="pre_feedforward")
+        self.make_mlp(layer_id, layer.mlp, root_input=self.layernorm_attrs["output_0"])
+
+        self.layernorm_attrs["first_layernorm"] = False
+        if layer_id == self.num_layers - 1:
+            # Norm after last decoder layer of model (last layer --> norm)
+            self.layernorm_attrs["last_layernorm"] = True
+
 
 def check_extra_options(kv_pairs):
     """
@@ -3398,8 +3450,10 @@ def create_model(model_name, input_path, output_dir, precision, execution_provid
             onnx_model = Phi4MMModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         elif config.architectures[0] == "Qwen2ForCausalLM":
             onnx_model = QwenModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
+        elif config.architectures[0] == "InstellaForCausalLM":
+            onnx_model = InstellaModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         else:
-            raise NotImplementedError(f"The {hf_name} model is not currently supported.")
+            raise NotImplementedError(f"The {config.architectures[0]} model is not currently supported.")
 
         # Make ONNX model
         onnx_model.make_model(input_path)

@@ -62,6 +62,8 @@ class QuantizedAttention:
         self.k_proj = QuantizedTensorModule(bits, group_size)
         self.v_proj = QuantizedTensorModule(bits, group_size)
         self.o_proj = QuantizedTensorModule(bits, group_size)
+        self.q_norm = TensorModule()
+        self.k_norm = TensorModule()
         self.rotary_emb = TensorModule()
 
 
@@ -78,6 +80,7 @@ class QuantizedDecoderLayer:
     def __init__(self, layer_id, bits, group_size):
         self.layer_id = layer_id
         self.input_layernorm = TensorModule()
+        self.pre_attention_layernorm = TensorModule()
         self.self_attn = QuantizedAttention(bits, group_size)
         self.post_attention_layernorm = TensorModule()
         self.pre_feedforward_layernorm = TensorModule()
@@ -158,6 +161,24 @@ class QuantizedModel:
                         elif bool(re.match(r"^model.layers\.\d+\.input_layernorm\.bias$", name)):
                             # model.layers.layer_id.input_layernorm.bias
                             module.input_layernorm.bias = tensor
+                        elif bool(re.match(r"^model.layers\.\d+\.pre_attention_layernorm\.weight$", name)):
+                            # model.layers.layer_id.pre_attention_layernorm.weight
+                            module.pre_attention_layernorm.weight = tensor
+                        elif bool(re.match(r"^model.layers\.\d+\.pre_attention_layernorm\.bias$", name)):
+                            # model.layers.layer_id.pre_attention_layernorm.bias
+                            module.pre_attention_layernorm.bias = tensor
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn\.q_norm\.weight$", name)):
+                            # model.layers.layer_id.self_attn.q_norm.weight
+                            module.self_attn.q_norm.weight = tensor
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn\.q_norm\.bias$", name)):
+                            # model.layers.layer_id.self_attn.q_norm.bias
+                            module.self_attn.q_norm.bias = tensor
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn\.k_norm\.weight$", name)):
+                            # model.layers.layer_id.self_attn.k_norm.weight
+                            module.self_attn.k_norm.weight = tensor
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn\.k_norm\.bias$", name)):
+                            # model.layers.layer_id.self_attn.k_norm.bias
+                            module.self_attn.k_norm.bias = tensor
                         elif bool(re.match(r"^model.layers\.\d+\.self_attn.rotary_emb\.inv_freq$", name)):
                             # model.layers.layer_id.self_attn.rotary_emb.inv_freq
                             # Skip rotary embedding weights since they can be re-calculated when looping through the model
